@@ -308,6 +308,27 @@ function isPathInside(base, target) {
     return !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
+function toElectronizePropertyArg(arg) {
+    if (typeof arg !== 'string') {
+        return arg;
+    }
+
+    return arg.replace(/^(?:-p:|\/p:)/i, '/property:');
+}
+
+function buildPublishOverrideArgs(profile) {
+    const args = [];
+
+    if (profile?.publishReadyToRun !== null && profile?.publishReadyToRun !== undefined) {
+        args.push(`/property:PublishReadyToRun=${profile.publishReadyToRun}`);
+    }
+    if (profile?.publishSingleFile !== null && profile?.publishSingleFile !== undefined) {
+        args.push(`/property:PublishSingleFile=${profile.publishSingleFile}`);
+    }
+
+    return args;
+}
+
 /**
  * Read a flag value from process.argv.
  * Accepts forms: --flag=value  or  --flag value
@@ -359,8 +380,13 @@ async function validatePublishProfile(nameOrNull, expectedRuntime) {
     }
 
     // Extract PublishUrl (treat as a file path)
-    const u = xml.match(/<PublishUrl>\s*([^<]+?)\s*<\/PublishUrl>/i);
-    const publishUrlRaw = u ? u[1].trim() : null;
+    const publishUrlMatch = xml.match(/<PublishUrl>\s*([^<]+?)\s*<\/PublishUrl>/i);
+    const publishUrlRaw = publishUrlMatch ? publishUrlMatch[1].trim() : null;
+
+    const publishReadyToRunMatch = xml.match(/<PublishReadyToRun>\s*([^<\s]+)\s*<\/PublishReadyToRun>/i);
+    const publishSingleFileMatch = xml.match(/<PublishSingleFile>\s*([^<\s]+)\s*<\/PublishSingleFile>/i);
+    const publishReadyToRun = publishReadyToRunMatch ? parseBooleanish(publishReadyToRunMatch[1].trim(), 'PublishReadyToRun') : null;
+    const publishSingleFile = publishSingleFileMatch ? parseBooleanish(publishSingleFileMatch[1].trim(), 'PublishSingleFile') : null;
 
     // Resolve publish path: absolute stays absolute, relative resolves against buildCwd
     let publishPath = null;
@@ -387,7 +413,9 @@ async function validatePublishProfile(nameOrNull, expectedRuntime) {
         name: path.parse(candidateFile).name,
         publishUrlRaw,   // original value from the .pubxml (e.g. "bin/Desktop/x86/")
         publishPath,     // resolved absolute file path (or null)
-        fullPath
+        fullPath,
+        publishReadyToRun,
+        publishSingleFile,
     };
 }
 
@@ -415,24 +443,34 @@ function escapeXml(value) {
 }
 
 /**
- * Reads and parses Properties/electron-builder.json from the project root.
- * Returns the full parsed config object.
+ * Reads and parses the app manifest/config from the project root.
+ * Prefers Properties/electron.manifest.json, with electron-builder.json as a fallback.
+ * If the file contains a nested `build` object, its contents are flattened onto the
+ * returned config so existing callers can keep reading mac/appId/productName at the top level.
  */
 async function readElectronBuilderConfig() {
-    const configPath = path.join(projectRoot, 'Properties', 'electron-builder.json');
-    if (!existsSync(configPath)) {
-        throw new Error(`electron-builder.json not found at: ${configPath}`);
+    const configCandidates = [
+        path.join(projectRoot, 'electron.manifest.json'),
+        path.join(projectRoot, 'Properties', 'electron.manifest.json'),
+        path.join(projectRoot, 'Properties', 'electron-builder.json'),
+    ];
+
+    const configPath = configCandidates.find(candidate => existsSync(candidate));
+    if (!configPath) {
+        throw new Error(`No Electron manifest/config found. Looked for: ${configCandidates.join(', ')}`);
     }
+
     const raw = await fs.readFile(configPath, 'utf8');
     try {
-        return JSON.parse(raw);
+        const parsed = JSON.parse(raw);
+        return isPlainObject(parsed.build) ? { ...parsed, ...parsed.build } : parsed;
     } catch (e) {
-        throw new Error(`Failed to parse electron-builder.json: ${e.message}`);
+        throw new Error(`Failed to parse Electron manifest/config at ${configPath}: ${e.message}`);
     }
 }
 
 /**
- * Reads Properties/electron-builder.json from the project root and returns:
+ * Reads the Electron manifest/config from the project root and returns:
  * {
  *   targetNames,          // all configured target strings in declared order
  *   primaryTargetName,    // the first configured target
@@ -447,7 +485,7 @@ async function readMacTargets() {
     const config = await readElectronBuilderConfig();
     const macTarget = config?.mac?.target;
     if (!macTarget) {
-        throw new Error('No mac.target found in Properties/electron-builder.json.');
+        throw new Error('No mac.target found in electron.manifest.json.');
     }
 
     const rawTargets = Array.isArray(macTarget) ? macTarget : [macTarget];
@@ -456,7 +494,7 @@ async function readMacTargets() {
         .filter(t => typeof t === 'string');
 
     if (targetNames.length === 0) {
-        throw new Error(`Could not resolve any target strings from mac.target in electron-builder.json. Got: ${JSON.stringify(macTarget)}`);
+        throw new Error(`Could not resolve any target strings from mac.target in electron.manifest.json. Got: ${JSON.stringify(macTarget)}`);
     }
 
     // electron-builder uses "mac" / "mac-arm64" as the output directory names
@@ -468,14 +506,14 @@ async function readMacTargets() {
     if (targetNames.length > 1) {
         if (installerTargetNames.length > 0 && nonInstallerTargetNames.length > 0) {
             throw new Error(
-                `Unsupported mac.target combination in electron-builder.json: ${targetNames.join(', ')}. ` +
+                `Unsupported mac.target combination in the Electron manifest/config: ${targetNames.join(', ')}. ` +
                 'Mixing installer targets (pkg/dmg/zip/tar.gz) with channel-style targets (mas/mas-dev/...) is not supported by MakeUniversal.js.'
             );
         }
 
         if (nonInstallerTargetNames.length > 1) {
             throw new Error(
-                `Unsupported mac.target combination in electron-builder.json: ${targetNames.join(', ')}. ` +
+                `Unsupported mac.target combination in electron.manifest.json: ${targetNames.join(', ')}. ` +
                 'Multiple channel-style targets are not supported by MakeUniversal.js.'
             );
         }
@@ -522,7 +560,9 @@ if (pkgLicensePath) {
 //  - publishPathX64
 //  - publishPathArm
 
-const appBundleName = cliAppName.endsWith('.app') ? cliAppName : `${cliAppName}.app`;
+const electronBuilderConfig = await readElectronBuilderConfig();
+const appBundleStem = electronBuilderConfig.productName || cliAppName;
+const appBundleName = appBundleStem.endsWith('.app') ? appBundleStem : `${appBundleStem}.app`;
 
 // Require publish paths from the provided publish profiles; quit if missing
 if (!publishPathX64) {
@@ -534,10 +574,10 @@ if (!publishPathArm) {
     process.exit(1);
 }
 
-// Read the mac target from electron-builder.json — drives the output directory names
+// Read the mac target from the electron.manifest.json — drives the output directory names
 // and determines whether a post-merge installer package should be produced.
 const macTarget = await readMacTargets();
-console.log(`Mac targets (from Properties/electron-builder.json): targetNames=${macTarget.targetNames.join(', ')}, primaryTargetName=${macTarget.primaryTargetName}, dirName=${macTarget.dirName}`);
+console.log(`Mac targets (from electron.manifest.json): targetNames=${macTarget.targetNames.join(', ')}, primaryTargetName=${macTarget.primaryTargetName}, dirName=${macTarget.dirName}`);
 const packagingTargets = new Set(['dmg', 'pkg']);
 const shouldCreateInstaller = macTarget.installerTargetNames.length > 0 && !skipInstaller;
 const configTargetSignIdentity = getConfigValue(makeUniversalConfig, ['macSigning', 'targets', macTarget.primaryTargetName, 'signIdentity']);
@@ -610,9 +650,10 @@ if (macTarget.installerTargetNames.length > 0 && skipInstaller) {
     console.log('Installer creation is disabled for this run (--no-installer / --skip-installer or packaging.enabled=false).');
 }
 
-// Compute app bundle paths using the publish paths (no fallbacks)
-const x64AppPath = path.resolve(publishPathX64, macTarget.dirName, appBundleName);
-const arm64AppPath = path.resolve(publishPathArm, `${macTarget.dirName}-arm64`, appBundleName);
+// Electron.NET packages the mac app bundles under bin/Desktop, not inside the publish output.
+const electronDesktopDir = path.resolve(buildCwd, 'bin', 'Desktop');
+const x64AppPath = path.resolve(electronDesktopDir, macTarget.dirName, appBundleName);
+const arm64AppPath = path.resolve(electronDesktopDir, `${macTarget.dirName}-arm64`, appBundleName);
 const outAppPath = path.resolve(buildCwd, 'bin', 'Desktop', 'universal', appBundleName);
 
 // Validate containment (must remain inside project root)
@@ -855,15 +896,19 @@ async function readProjectVersion() {
     return m[1].trim().split('.').slice(0, 3).join('.');
 }
 
+async function getPackagingVersion() {
+    return versionVal || await readProjectVersion();
+}
+
 /**
  * Builds a copy-friendly installer base name such as "ExampleApp-1.1.1".
- * Product metadata comes from Properties/electron-builder.json so existing
+ * Product metadata comes from the electron.manifest.json so existing
  * project settings continue to drive naming without depending on electron-builder.
  */
 async function getInstallerArtifactBaseName() {
     const ebConfig = await readElectronBuilderConfig();
     const productName = ebConfig.productName || cliAppName;
-    const version = await readProjectVersion();
+    const version = await getPackagingVersion();
     return `${productName}-${version}`;
 }
 
@@ -1199,7 +1244,7 @@ async function createPkgInstaller() {
     const ebConfig = await readElectronBuilderConfig();
     const baseName = await getInstallerArtifactBaseName();
     const artifactPath = path.join(path.dirname(outAppPath), `${baseName}.pkg`);
-    const version = await readProjectVersion();
+    const version = await getPackagingVersion();
     const appId = ebConfig.appId || 'com.example.app';
     const universalDir = path.dirname(outAppPath);
 
@@ -1548,11 +1593,64 @@ async function notarizeAndStapleUniversalApp() {
 console.log('=== STEP 2: Building Electron applications ===');
 
 // Determine publish profile arguments (fall back to defaults if none provided)
-const publishArgX64_2 = publishProfileOsxX64Name ? `-p:PublishProfile=${publishProfileOsxX64Name}` : '-p:PublishProfile=publish-osx-x64';
-const publishArgArm_2 = publishProfileOsxArmName ? `-p:PublishProfile=${publishProfileOsxArmName}` : '-p:PublishProfile=publish-osx-arm64';
+const publishArgX64_2 = publishProfileOsxX64Name
+    ? `-p:PublishProfile=${publishProfileOsxX64Name}`
+    : '-p:PublishProfile=publish-osx-x64';
+const publishArgArm_2 = publishProfileOsxArmName
+    ? `-p:PublishProfile=${publishProfileOsxArmName}`
+    : '-p:PublishProfile=publish-osx-arm64';
 
-await runCommand('dotnet', ['publish', `${cliAppName}.csproj`, publishArgX64_2,  ...extraDotnetArgs], buildCwd);
-await runCommand('dotnet', ['publish', `${cliAppName}.csproj`, publishArgArm_2,  ...extraDotnetArgs], buildCwd);
+// Build step: Prefer using `electronize` to create the Electron packages
+async function tryElectronizeBuild(target, publishArg, versionVal) {
+    // Native electronize CLI: include /target, /package-json and /Version flags
+    const nativeArgs = ['build', '/target', target, '/package-json', 'package.json'];
+    if (versionVal) {
+        nativeArgs.push('/Version', versionVal);
+    }
+    const electronArch = target === 'osx-x64' ? 'x64' : 'arm64';
+    nativeArgs.push('/electron-arch', electronArch);
+
+    // Forward MSBuild properties using the electronize /property syntax.
+    if (publishArg) {
+        nativeArgs.push(toElectronizePropertyArg(publishArg));
+    }
+    const profileOverrides = buildPublishOverrideArgs(target === 'osx-x64' ? profileX64 : profileArm);
+    for (const a of profileOverrides) {
+        nativeArgs.push(a);
+    }
+    for (const a of extraDotnetArgs) {
+        nativeArgs.push(toElectronizePropertyArg(a));
+    }
+
+    try {
+        await runCommand('electronize', nativeArgs, buildCwd);
+        return;
+    } catch (errA) {
+        // Fall through to try the dotnet-invoked electronize variant.
+    }
+
+    // dotnet electronize variant: pass publish/profile and raw extra dotnet args directly.
+    const dotnetArgs = ['electronize', 'build', '/target', target, '/package-json', 'package.json'];
+    if (versionVal) {
+        dotnetArgs.push('/Version', versionVal);
+    }
+    dotnetArgs.push('/electron-arch', electronArch);
+    if (publishArg) dotnetArgs.push(publishArg);
+    for (const a of buildPublishOverrideArgs(target === 'osx-x64' ? profileX64 : profileArm)) {
+        dotnetArgs.push(a);
+    }
+    dotnetArgs.push(...extraDotnetArgs);
+
+    await runCommand('dotnet', dotnetArgs, buildCwd);
+}
+
+// Extract /Version from --dotnet-arg -p:Version=<value> passed on the command line.
+const versionArgMatch = extraDotnetArgs.find(a => /^(?:-p:|\/p:)Version=/i.test(a));
+const versionVal = versionArgMatch ? versionArgMatch.replace(/^(?:-p:|\/p:)Version=/i, '') : null;
+
+console.log('Building mac targets with electronize: osx-x64 and osx-arm64' + (versionVal ? ` (version: ${versionVal})` : ''));
+await tryElectronizeBuild('osx-x64', publishArgX64_2, versionVal);
+await tryElectronizeBuild('osx-arm64', publishArgArm_2, versionVal);
 
 
 
@@ -1578,7 +1676,7 @@ await makeUniversalApp({
     arm64AppPath,
     outAppPath,
     force: true,
-    x64ArchFiles: ['**/Example/**/*', '**/Example-SQLite.Interop.dll'],
+    x64ArchFiles: '**/{Example/**/*,Example-SQLite.Interop.dll,Contents/Resources/bin/**/*}',
     mergeASARs: true,
 });
 console.log('Universal app created at:', outAppPath + '\n');
